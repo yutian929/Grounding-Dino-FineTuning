@@ -1,0 +1,3 @@
+build/
+weights/*.pth
+weights/fine_tuning_weights/*.pth
