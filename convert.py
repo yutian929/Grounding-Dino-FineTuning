@@ -3,6 +3,7 @@ import csv
 import os
 from pathlib import Path
 import argparse
+import cv2
 
 def convert_coco_to_csv(coco_json_path, csv_output_path):
     """
@@ -16,6 +17,10 @@ def convert_coco_to_csv(coco_json_path, csv_output_path):
     # Load COCO JSON file
     with open(coco_json_path, 'r') as f:
         coco_data = json.load(f)
+    
+    # rewrite with indent=4
+    with open(coco_json_path, 'w') as f:
+        json.dump(coco_data, f, indent=4)
 
     # Extract categories, images, and annotations
     categories = {category['id']: category['name'] for category in coco_data['categories']}
@@ -74,6 +79,47 @@ def convert_coco_to_csv(coco_json_path, csv_output_path):
     print(f"Output saved to: {csv_output_path}")
 
 
+def check(ann_file, images_dir="multimodal-data/images"):
+    with open(ann_file) as file_obj:
+        ann_reader= csv.DictReader(file_obj)  
+        # Iterate over each row in the csv file
+        # using reader object
+        # read the first image
+        row_0 = next(ann_reader)
+        img_n_0 = row_0['image_name']
+        x1_list = [int(row_0['bbox_x'])]
+        y1_list = [int(row_0['bbox_y'])]
+        x2_list = [int(row_0['bbox_x'])+int(row_0['bbox_width'])]
+        y2_list = [int(row_0['bbox_y'])+int(row_0['bbox_height'])]
+        label_list = [row_0['label_name']]
+        for row in ann_reader:
+            #print(row)
+            img_n=row['image_name']
+            if img_n != img_n_0:
+                break
+            x1_list.append(int(row['bbox_x']))
+            y1_list.append(int(row['bbox_y']))
+            x2_list.append(x1_list[-1] + int(row['bbox_width']))
+            y2_list.append(y1_list[-1] + int(row['bbox_height']))
+            label_list.append(row['label_name'])
+        # draw the first image
+        img_0_path = os.path.join(images_dir, img_n_0)
+        img_0 = cv2.imread(img_0_path)
+        for i in range(len(label_list)):
+            x1 = int(x1_list[i])
+            y1 = int(y1_list[i])
+            x2 = int(x2_list[i])
+            y2 = int(y2_list[i])
+            label = label_list[i]
+            cv2.rectangle(img_0, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(img_0, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        cv2.imwrite(f"check_{img_n_0}", img_0)
+    
+def compare(ann_file, example_ann_file):
+    check(ann_file)
+    check(example_ann_file, images_dir="multimodal-data-example/images")
+    print(f"Comparison between {ann_file} and {example_ann_file} completed.")
+
 def main():
     parser = argparse.ArgumentParser(description='Convert COCO JSON annotations to CSV format for Grounding DINO fine-tuning')
     parser.add_argument('--coco_json', type=str, default='multimodal-data/annotation/_annotations.coco.json',
@@ -88,6 +134,11 @@ def main():
     
     convert_coco_to_csv(args.coco_json, args.output_csv)
 
+    # Compare with example annotations
+    example_ann_file = 'multimodal-data-example/annotation/annotation.csv'
+    compare(args.output_csv, example_ann_file)
+
 
 if __name__ == "__main__":
     main()
+    

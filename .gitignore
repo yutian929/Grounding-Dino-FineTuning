@@ -4,3 +4,6 @@ weights/fine_tuning_weights/*.pth
 multimodal-data/**/*.jpg
 multimodal-data/**/*.png
 *.zip
+*.jpg
+*.log
+*.pyc

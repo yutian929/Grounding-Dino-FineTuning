@@ -1,4 +1,4 @@
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 
 import cv2
 import numpy as np
@@ -9,6 +9,7 @@ from torchvision.ops import box_convert
 from torchvision.ops import box_iou, generalized_box_iou ,sigmoid_focal_loss
 import torch.nn.functional as F
 import bisect
+from torch.utils.data import Dataset, DataLoader
 
 import groundingdino.datasets.transforms as T
 from groundingdino.models import build_model
@@ -123,7 +124,167 @@ def train_image(model,
     return total_loss
 
 
+def train_batch(model,
+                image_sources,
+                images: torch.Tensor,
+                caption_objects_batch: List[list],
+                box_targets_batch: List[list],
+                batch_size: int = 8,
+                device: str = "cuda"):
+    """
+    Train model with a batch of images and annotations
+    
+    Args:
+        model: The GroundingDINO model
+        image_sources: List of source images (numpy arrays)
+        images: Batch of images as tensor [batch_size, C, H, W]
+        caption_objects_batch: List of lists containing caption objects for each image
+        box_targets_batch: List of lists containing target boxes for each image
+        batch_size: Batch size
+        device: Device to run the model on
+    
+    Returns:
+        Total loss for the batch
+    """
+    # Move model and input to device
+    model = model.to(device)
+    images = images.to(device)
+    
+    tokenizer = model.tokenizer
+    total_loss = 0.0
+    
+    # Process each image in the batch
+    all_outputs = None
+    all_captions = []
+    
+    # Prepare captions for all images in batch
+    for caption_objects in caption_objects_batch:
+        caption = preprocess_caption(caption=".".join(set(caption_objects)))
+        all_captions.append(caption)
+    
+    # Forward pass for the whole batch
+    outputs = model(images, captions=all_captions)
+    
+    # Process each image in the batch
+    for idx in range(batch_size):
+        # Skip if we've run out of actual data
+        if idx >= len(caption_objects_batch):
+            break
+        
+        caption_objects = caption_objects_batch[idx]
+        box_target = box_targets_batch[idx]
+        image_source = image_sources[idx]
+        
+        # Process outputs for this sample
+        logits = outputs["pred_logits"][idx]
+        boxes = outputs["pred_boxes"][idx]
+        
+        # Get object positions for this caption
+        caption = all_captions[idx]
+        tokenized = tokenizer(caption)
+        
+        def get_object_positions(tokenized, caption_objects):
+            positions_dict = {}
+            for obj_name in caption_objects:
+                obj_token = tokenizer(obj_name + ".")['input_ids']
+                start_pos = next((i for i, _ in enumerate(tokenized['input_ids']) if 
+                                tokenized['input_ids'][i:i+len(obj_token)-2] == obj_token[1:-1]), None)
+                if start_pos is not None:
+                    positions_dict[obj_name] = [start_pos, start_pos + len(obj_token) - 2]
+            return positions_dict
+        
+        object_positions = get_object_positions(tokenized, caption_objects)
+        
+        # Bounding box losses
+        h, w, _ = image_source.shape
+        boxes = boxes * torch.Tensor([w, h, w, h]).to(device)
+        box_predicted = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy")
+        box_target_tensor = torch.tensor(box_target).to(device)
+        ious = generalized_box_iou(box_target_tensor, box_predicted)
+        maxvals, maxidx = torch.max(ious, dim=1)
+        selected_preds = box_predicted.gather(0, maxidx.unsqueeze(-1).repeat(1, box_predicted.size(1)))
+        regression_loss = F.smooth_l1_loss(box_target_tensor, selected_preds)
+        iou_loss = 1.0 - maxvals.mean()
+        reg_loss = iou_loss + regression_loss
 
+        # Logit losses
+        selected_logits = logits.gather(0, maxidx.unsqueeze(-1).repeat(1, logits.size(1)))
+        targets_logits_list = []
+        for obj_name, logit in zip(caption_objects, selected_logits):
+            target = torch.zeros_like(logit).to(device)
+            if obj_name in object_positions:  # Handle case where object position not found
+                start, end = object_positions[obj_name]
+                target[start:end] = 1.0
+            targets_logits_list.append(target)
+
+        if targets_logits_list:  # Check if list is not empty
+            targets_logits = torch.stack(targets_logits_list, dim=0)
+            cls_loss = focal_loss(selected_logits, targets_logits)
+        else:
+            cls_loss = torch.tensor(0.0, device=device)
+
+        # Total loss for this sample
+        delta_factor = 0.01
+        sample_loss = cls_loss + delta_factor * reg_loss
+        total_loss += sample_loss
+        
+        print(f"Sample {idx} - Regression loss: {reg_loss.item()}, Classification loss: {cls_loss.item()}")
+    
+    # Average loss over actual batch size
+    return total_loss / len(caption_objects_batch)
+
+
+class GroundingDINODataset(Dataset):
+    """Dataset for Grounding DINO training"""
+    
+    def __init__(self, ann_dict, transform=None):
+        self.image_paths = list(ann_dict.keys())
+        self.annotations = ann_dict
+        self.transform = transform if transform else self._default_transform()
+        
+    def _default_transform(self):
+        return T.Compose([
+            T.RandomResize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        image_path = self.image_paths[idx]
+        image_source = Image.open(image_path).convert("RGB")
+        image = np.asarray(image_source)
+        transformed_image, _ = self.transform(image_source, None)
+        
+        boxes = self.annotations[image_path]['boxes']
+        captions = self.annotations[image_path]['captions']
+        
+        return {
+            'image_source': image,
+            'image': transformed_image,
+            'caption_objects': captions,
+            'box_target': boxes,
+            'image_path': image_path
+        }
+
+
+def collate_fn(batch):
+    """Collate function for DataLoader"""
+    image_sources = [item['image_source'] for item in batch]
+    images = torch.stack([item['image'] for item in batch])
+    caption_objects_batch = [item['caption_objects'] for item in batch]
+    box_targets_batch = [item['box_target'] for item in batch] 
+    image_paths = [item['image_path'] for item in batch]
+    
+    return {
+        'image_sources': image_sources,
+        'images': images,
+        'caption_objects_batch': caption_objects_batch,
+        'box_targets_batch': box_targets_batch,
+        'image_paths': image_paths
+    }
 
 
 def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: torch.Tensor, phrases: List[str]) -> np.ndarray:

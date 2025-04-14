@@ -1,4 +1,4 @@
-from groundingdino.util.train import load_model, load_image,train_image, annotate
+from groundingdino.util.train import load_model, load_image, train_image, annotate, train_batch, GroundingDINODataset, collate_fn
 import cv2
 import os
 import json
@@ -6,6 +6,7 @@ import csv
 import torch
 from collections import defaultdict
 import torch.optim as optim
+from torch.utils.data import DataLoader
 
 # Model
 model = load_model("groundingdino/config/GroundingDINO_SwinT_OGC.py", "weights/groundingdino_swint_ogc.pth")
@@ -66,8 +67,6 @@ def draw_box_with_label(image, output_path, coordinates, label, color=(0, 0, 255
     # Save the modified image
     cv2.imwrite(output_path, image)
 
-
-
 def read_dataset(ann_file):
     ann_Dict= defaultdict(lambda: defaultdict(list))
     with open(ann_file) as file_obj:
@@ -87,9 +86,20 @@ def read_dataset(ann_file):
     return ann_Dict
 
 
-def train(model, ann_file, epochs=1, save_path='weights/model_weights', save_epoch=50):
+def train(model, ann_file, epochs=1, save_path='weights/model_weights', save_epoch=50, batch_size=8):
     # Read Dataset
     ann_Dict = read_dataset(ann_file)
+    
+    # Create dataset and dataloader
+    dataset = GroundingDINODataset(ann_Dict)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=batch_size,
+        shuffle=True, 
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=True
+    )
     
     # Add optimizer with weight decay for regularization
     optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
@@ -109,31 +119,39 @@ def train(model, ann_file, epochs=1, save_path='weights/model_weights', save_epo
 
     for epoch in range(epochs):
         total_loss = 0
-        for idx, (IMAGE_PATH, vals) in enumerate(ann_Dict.items()):
-            image_source, image = load_image(IMAGE_PATH)
-            bxs = vals['boxes']
-            captions = vals['captions']
-
+        batch_count = 0
+        
+        for batch_idx, batch in enumerate(dataloader):
             # Zero the gradients
             optimizer.zero_grad()
             
-            # Call the training function for each image and its annotations
-            loss = train_image(
+            # Get the batch data
+            image_sources = batch['image_sources']
+            images = batch['images']
+            caption_objects_batch = batch['caption_objects_batch']
+            box_targets_batch = batch['box_targets_batch']
+            
+            # Call the batch training function
+            loss = train_batch(
                 model=model,
-                image_source=image_source,
-                image=image,
-                caption_objects=captions,
-                box_target=bxs,
+                image_sources=image_sources,
+                images=images,
+                caption_objects_batch=caption_objects_batch,
+                box_targets_batch=box_targets_batch,
+                batch_size=len(image_sources)
             )
             
             # Backpropagate and optimize
             loss.backward()
             optimizer.step()
             
-            total_loss += loss.item()  # Accumulate the loss
-            print(f"Processed image {idx+1}/{len(ann_Dict)}, Loss: {loss.item()}")
+            # Accumulate the loss
+            total_loss += loss.item()
+            batch_count += 1
+            
+            print(f"Epoch {epoch+1}/{epochs}, Batch {batch_idx+1}/{len(dataloader)}, Loss: {loss.item()}")
 
-        avg_loss = total_loss / len(ann_Dict)
+        avg_loss = total_loss / batch_count
         print(f"Epoch {epoch+1}/{epochs}, Average Loss: {avg_loss}")
         
         # Learning rate scheduling
@@ -173,7 +191,8 @@ if __name__=="__main__":
     train(
         model=model,
         ann_file=ann_file,
-        epochs=201,
+        epochs=101,
         save_path='weights/fine_tuning_weights/',
-        save_epoch=50
+        save_epoch=10,
+        batch_size=8  # Added batch size parameter
     )
